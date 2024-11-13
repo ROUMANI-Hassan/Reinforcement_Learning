@@ -1,185 +1,200 @@
-from keras.src.models import Sequential
-from keras.src.layers import Dense,Input, Dropout, Conv2D, MaxPooling2D, Activation, Flatten,GlobalAveragePooling2D
-from keras.src.callbacks import TensorBoard
-from keras.src.optimizers import Adam
-from collections import deque
-import numpy as np
-import tensorflow as tf
-import time
-import random
 import gymnasium as gym
+import numpy as np
+import matplotlib.pyplot as plt
+from collections import deque
+import random
+import torch
+from torch import nn
+import torch.nn.functional as F
 import game_env
-import os
-from tqdm import tqdm
 
-DISCOUNT = 0.99
-REPLAY_MEMORY_SIZE = 100_000  # How many last steps to keep for model training
-MIN_REPLAY_MEMORY_SIZE = 1_000  # Minimum number of steps in a memory to start training
-MINIBATCH_SIZE = 64  # How many steps (samples) to use for training
-UPDATE_TARGET_EVERY = 5  # Terminal states (end of episodes)
-MODEL_NAME = '2x256'
-MIN_REWARD = -200  # For model save
-MEMORY_FRACTION = 0.20
+class DQN(nn.Module):
+    def __init__(self, input_shape, out_actions):
+        super().__init__()
+        self.conv_block1 = nn.Sequential(
+            nn.Conv2d(in_channels=1, out_channels=10, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(in_channels=10, out_channels=10, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2)
+        )
 
-# Environment settings
-EPISODES = 20_000
+        self.conv_block2 = nn.Sequential(
+            nn.Conv2d(in_channels=10, out_channels=10, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(in_channels=10, out_channels=10, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2)
+        )
 
-# Exploration settings
-epsilon = 1  # not a constant, going to be decayed
-EPSILON_DECAY = 0.99975
-MIN_EPSILON = 0.001
+        self.layer_stack = nn.Sequential(
+            nn.Flatten(), 
+            nn.Linear(in_features=10*2*2, out_features=out_actions)
+        )
 
-#  Stats settings
-AGGREGATE_STATS_EVERY = 50  # episodes
-SHOW_PREVIEW = True
-
-
-class DQNAgent:
-    def __init__(self):
-        # main model  # gets trained every step
-        self.model = self.create_model()
-
-        # Target model this is what we .predict against every step
-        self.target_model = self.create_model()
-        self.target_model.set_weights(self.model.get_weights())
-
-        self.replay_memory = deque(maxlen=REPLAY_MEMORY_SIZE)
-        self.target_update_counter = 0
-
-    def create_model(self):
-        model = Sequential()
-        model.add(Input(shape=env.observation_space.shape))
-        model.add(Conv2D(256, (3, 3)))
-        model.add(Activation("relu"))
-        model.add(MaxPooling2D(2, 2))
-        model.add(Dropout(0.2))
-
-        model.add(Conv2D(256, (3, 3)))
-        model.add(Activation("relu"))
-        model.add(MaxPooling2D(2, 2))
-        model.add(Dropout(0.2))
-        model.add(GlobalAveragePooling2D())
-        model.add(Flatten())
-        model.add(Dense(64))
-        
-        model.add(Dense(env.action_space.n))
-        model.add(Activation("linear"))
-        model.compile(loss="mse", optimizer=Adam(learning_rate=0.001), metrics=['accuracy'])
-        return model
+    def forward(self, x):
+        x = self.conv_block1(x)
+        x = self.conv_block2(x)
+        x = self.layer_stack(x)
+        return x
     
-    def update_replay_memory(self, transition):
-        self.replay_memory.append(transition)
+class ReplayMemory():
+    def __init__(self, maxlen):
+        self.memory = deque([], maxlen=maxlen)
 
-    # Trains main network every step during episode
-    def train(self, terminal_state, step):
-        # Start training only if certain number of samples is already saved
-        if len(self.replay_memory) < MIN_REPLAY_MEMORY_SIZE:
-            return
-        # Get a minibatch of random samples from memory replay table
-        minibatch = random.sample(self.replay_memory, MINIBATCH_SIZE)
-        # Get current states from minibatch, then query NN model for Q values
-        current_states = np.array([transition[0] for transition in minibatch])
-        current_qs_list = self.model.predict(current_states)
-        
-        # Get future states from minibatch, then query NN model for Q values
-        # When using target network, query it, otherwise main network should be queried
-        new_current_states = np.array([transition[3] for transition in minibatch])/255
-        future_qs_list = self.target_model.predict(new_current_states)
+    def append(self, transition):
+        self.memory.append(transition)
 
-        X = []
-        y = []
-        # Now we need to enumerate our batches
-        for index, (current_state, action, reward, new_current_state, done) in enumerate(minibatch):
+    def sample(self, sample_size):
+        return random.sample(self.memory, sample_size)
 
-            # If not a terminal state, get new q from future states, otherwise set it to 0
-            # almost like with Q Learning, but we use just part of equation here
-            if not done:
-                max_future_q = np.max(future_qs_list[index])
-                new_q = reward + DISCOUNT * max_future_q
+    def __len__(self):
+        return len(self.memory)
+
+class ROBOT_DQN():
+    learning_rate_a = 0.001
+    discount_factor_g = 0.9
+    network_sync_rate = 10
+    replay_memory_size = 100000
+    mini_batch_size = 64
+
+    loss_fn = nn.MSELoss()
+    optimizer = None
+
+    ACTIONS = ['U','TR','R','BR','B','BL','L','TL']
+
+    def train(self, episodes, render='h', is_slippery=False):
+        env = gym.make('robot-v0', render_mode='human')
+        num_states = 100
+        num_actions = 8
+
+        epsilon = 1
+        min_epsilon = 0.0001
+        epsilon_decay = 0.995
+        memory = ReplayMemory(self.replay_memory_size)
+
+        policy_dqn = DQN(input_shape=env.observation_space.shape[0], out_actions=num_actions)
+        target_dqn = DQN(input_shape=env.observation_space.shape[0], out_actions=num_actions)
+
+        target_dqn.load_state_dict(policy_dqn.state_dict())
+
+        self.optimizer = torch.optim.Adam(policy_dqn.parameters(), lr=self.learning_rate_a)
+
+        rewards_per_episode = np.zeros(episodes)
+        epsilon_history = []
+
+        for i in range(episodes):
+            step_count = 0
+            state,_ = env.reset()
+            terminated = False
+            truncated = False
+            reward_add = 0
+            while(not terminated and not truncated):
+                if(render=='human'):
+                    env.render()
+                if random.random() < epsilon:
+                    action = env.action_space.sample()
+                else:
+                    with torch.no_grad():
+                        action = policy_dqn(self.state_to_dqn_input(state)).argmax().item()
+
+                new_state, reward, terminated, truncated, _ = env.step(action)
+                reward_add += reward
+                memory.append((state, action, new_state, reward, terminated))
+                
+                state = new_state
+                step_count += 1
+
+            rewards_per_episode[i] = reward_add
+            reward_add = 0
+
+            if len(memory) > self.mini_batch_size:
+                mini_batch = memory.sample(self.mini_batch_size)
+                self.optimize(mini_batch, policy_dqn, target_dqn)
+                epsilon = max(min_epsilon, epsilon * epsilon_decay)
+                epsilon_history.append(epsilon)
+
+                if step_count > self.network_sync_rate:
+                    step_count = 0
+                    torch.save(policy_dqn.state_dict(), f"robot{i+1}_R{rewards_per_episode[i]}.pt")
+                    target_dqn.load_state_dict(policy_dqn.state_dict())
+                    
+        env.close()
+        torch.save(policy_dqn.state_dict(), "ROBOT.pt")
+
+        plt.figure(1)
+        sum_rewards = np.zeros(episodes)
+        for x in range(episodes):
+            sum_rewards[x] = np.sum(rewards_per_episode[max(0, x-100):(x+1)])
+        plt.subplot(121)
+        plt.plot(sum_rewards)
+        plt.subplot(122)
+        plt.plot(epsilon_history)
+        plt.savefig('ROBOT.png')
+
+    def optimize(self, mini_batch, policy_dqn, target_dqn):
+        current_q_list = []
+        target_q_list = []
+
+        for state, action, new_state, reward, terminated in mini_batch:
+            if terminated:
+                target = torch.FloatTensor([reward])
             else:
-                new_q = reward
+                with torch.no_grad():
+                    target = torch.FloatTensor(
+                        reward + self.discount_factor_g * target_dqn(self.state_to_dqn_input(new_state)).max()
+                    )
 
-            # Update Q value for given state
-            current_qs = current_qs_list[index]
-            current_qs[action] = new_q
+            current_q = policy_dqn(self.state_to_dqn_input(state))
+            current_q_list.append(current_q)
 
-            # And append to our training data
-            X.append(current_state)
-            y.append(current_qs)
-        # Fit on all samples as one batch, log only on terminal state
-        self.model.fit(np.array(X)/255, np.array(y), batch_size=MINIBATCH_SIZE, verbose=0, shuffle=False)
+            target_q = target_dqn(self.state_to_dqn_input(state))
+            target_q[0][action] = target
+            target_q_list.append(target_q)
 
-        # Update target network counter every episode
-        if terminal_state:
-            self.target_update_counter += 1
+        loss = self.loss_fn(torch.stack(current_q_list), torch.stack(target_q_list))
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
 
-        # If counter reaches set value, update target network with weights of main network
-        if self.target_update_counter > UPDATE_TARGET_EVERY:
-            self.target_model.set_weights(self.model.get_weights())
-            self.target_update_counter = 0
+    def state_to_dqn_input(self, state: int) -> torch.Tensor:
+        input_tensor = torch.zeros(1, 1, 10, 10)
+        r = state // 10
+        c = state % 10
+        input_tensor[0][0][r][c] = 128 / 255
+        return input_tensor
 
-    # Queries main network for Q values given current observation space (environment state)
-    def get_qs(self, state):
-        return self.model.predict(np.array(state).reshape(-1, *state.shape)/255)[0]
-    
-env = gym.make('robot-v0', render_mode='human')
+    def test(self, episodes):
+        env = gym.make('robot-v0', render_mode='human')
+        num_states = env.observation_space.n
+        num_actions = env.action_space.n
 
-# For stats
-ep_rewards = [-200]
+        policy_dqn = DQN(input_shape=3, out_actions=num_actions)
+        policy_dqn.load_state_dict(torch.load("frozen_lake_dql_cnn.pt", weights_only=True))
+        policy_dqn.eval()
 
+        for i in range(episodes):
+            state = env.reset()[0]
+            terminated = False
+            truncated = False
+            while(not terminated and not truncated):
+                with torch.no_grad():
+                    action = policy_dqn(self.state_to_dqn_input(state)).argmax().item()
+                state, reward, terminated, truncated, _ = env.step(action)
+        env.close()
 
-# Memory fraction, used mostly when trai8ning multiple agents
-#gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=MEMORY_FRACTION)
-#backend.set_session(tf.Session(config=tf.ConfigProto(gpu_options=gpu_options)))
+    def print_dqn(self, dqn):
+        for s in range(16):
+            q_values = ''
+            for q in dqn(self.state_to_dqn_input(s))[0].tolist():
+                q_values += "{:+.2f}".format(q) + ' '
+            q_values = q_values.rstrip()
+            best_action = self.ACTIONS[dqn(self.state_to_dqn_input(s)).argmax()]
+            print(f'{s:02},{best_action},[{q_values}]', end=' ')
+            if (s + 1) % 4 == 0:
+                print()
 
-# Create models folder
-if not os.path.isdir('models'):
-    os.makedirs('models')
-
-agent = DQNAgent()
-
-for episode in tqdm(range(1, EPISODES + 1), ascii=True, unit='episodes'):
-
-    # Restarting episode - reset episode reward and step number
-    episode_reward = 0
-    step = 1
-
-    # Reset environment and get initial state
-    current_state = env.reset()
-
-    # Reset flag and start iterating until episode ends
-    done = False
-    truncated = False
-    while not (done or truncated):
-
-        # This part stays mostly the same, the change is to query a model for Q values
-        if np.random.random() > epsilon:
-            # Get action from Q table
-            action = np.argmax(agent.get_qs(current_state))
-        else:
-            # Get random action
-            action = np.random.randint(0, env.action_space.n)
-
-        new_state, reward, done, truncated,_ = env.step(action)
-        # Transform new continous state to new discrete state and count reward
-        episode_reward += reward
-        # Every step we update replay memory and train main network
-        agent.update_replay_memory((current_state, action, reward, new_state, done))
-        agent.train(done, step)
-        current_state = new_state
-        step += 1
-        
-    # Append episode reward to a list and log stats (every given number of episodes)
-    ep_rewards.append(episode_reward)
-    if not episode % AGGREGATE_STATS_EVERY or episode == 1:
-        average_reward = sum(ep_rewards[-AGGREGATE_STATS_EVERY:])/len(ep_rewards[-AGGREGATE_STATS_EVERY:])
-        min_reward = min(ep_rewards[-AGGREGATE_STATS_EVERY:])
-        max_reward = max(ep_rewards[-AGGREGATE_STATS_EVERY:])
-
-        # Save model, but only when min reward is greater or equal a set value
-        if min_reward >= MIN_REWARD:
-            agent.model.save(f'models/{MODEL_NAME}__{max_reward:_>7.2f}max_{average_reward:_>7.2f}avg_{min_reward:_>7.2f}min__{int(time.time())}.keras')
-
-    # Decay epsilon
-    if epsilon > MIN_EPSILON:
-        epsilon *= EPSILON_DECAY
+if __name__ == '__main__':
+    R = ROBOT_DQN()
+    is_slippery = False
+    R.train(10000)
